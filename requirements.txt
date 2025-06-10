@@ -1,0 +1,11 @@
+faiss-cpu==1.8.0
+sentence-transformers==3.0.1
+pandas>=2.0.0
+numpy>=1.23.0
+scikit-learn>=1.2.0
+streamlit>=1.20.0
+plotly>=5.10.0
+joblib>=1.2.0
+python-dotenv>=0.20.0
+openai>=1.0.0
+pinecone
