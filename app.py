@@ -7,27 +7,42 @@ import plotly.graph_objects as go
 import joblib
 from datetime import datetime, timedelta
 import warnings
-warnings.filterwarnings('ignore')
 import textwrap
 from openai import OpenAI
 from dotenv import load_dotenv
 import os
+import boto3
+import io
+import botocore.exceptions
 
+warnings.filterwarnings('ignore')
 
-
-CSV_FILE = "newww.csv"
-PREDICTED_CSV_FILE = "new_predictions2.csv"
-MODEL_OUTPUT = "isolation_forest_model.pkl"
+# AWS S3 Configuration
+S3_BUCKET = os.getenv("S3_BUCKET", "your-bucket-name")  # Load from environment variable, fallback to placeholder
+S3_CSV_FILE = "newww.csv"
+S3_PREDICTED_CSV_FILE = "new_predictions2.csv"
+S3_MODEL_OUTPUT = "isolation_forest_model.pkl"
 RANDOM_STATE = 42
 CONTAMINATION = 0.1
-INJECTION_THRESHOLD = 1000
+
+# Initialize S3 client
+try:
+    s3_client = boto3.client('s3')
+except botocore.exceptions.NoCredentialsError:
+    st.error("AWS credentials not found. Please configure AWS credentials.")
+    st.stop()
 
 @st.cache_data
-def load_and_preprocess_data(file_path):
+def load_and_preprocess_data(s3_bucket, s3_key):
     try:
-        df = pd.read_csv(file_path)
-    except FileNotFoundError:
-        raise FileNotFoundError(f"CSV file '{file_path}' not found.")
+        # Download CSV from S3
+        obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+    except s3_client.exceptions.NoSuchKey:
+        raise FileNotFoundError(f"CSV file '{s3_key}' not found in S3 bucket '{s3_bucket}'.")
+    except botocore.exceptions.ClientError as e:
+        st.error(f"Error accessing S3: {e}")
+        raise
 
     expected_columns = [
         'injection_time', 'system_name', 'column_serial_number', 'peak_width_5', 'retention_time', 
@@ -112,8 +127,13 @@ def detect_anomalies(df, X, model, feature_cols, selected_param):
     Q1 = df[selected_param].quantile(0.25)
     Q3 = df[selected_param].quantile(0.75)
     IQR = Q3 - Q1
-    upper_threshold = Q3 + 1.5 * IQR
-    lower_threshold = Q1 - 1.5 * IQR
+    if IQR == 0:
+        st.warning(f"IQR for {selected_param} is 0. Using default thresholds.")
+        upper_threshold = Q3 + 1.5
+        lower_threshold = Q1 - 1.5
+    else:
+        upper_threshold = Q3 + 1.5 * IQR
+        lower_threshold = Q1 - 1.5 * IQR
     
     df['anomaly_feature'] = selected_param
     df['anomaly_deviation'] = df[selected_param].apply(
@@ -123,15 +143,24 @@ def detect_anomalies(df, X, model, feature_cols, selected_param):
     
     return df, {'Q1': Q1, 'Q3': Q3, 'IQR': IQR, 'upper_threshold': upper_threshold, 'lower_threshold': lower_threshold}
 
-def load_predicted_anomalies(file_path, selected_param, iqr_stats):
+def load_predicted_anomalies(s3_bucket, s3_key, selected_param, iqr_stats):
     try:
-        df = pd.read_csv(file_path)
-    except FileNotFoundError:
-        st.error(f"Predicted anomalies CSV file '{file_path}' not found.")
+        # Download predicted CSV from S3
+        obj = s3_client.get_object(Bucket=s3_bucket, Key=s3_key)
+        df = pd.read_csv(io.BytesIO(obj['Body'].read()))
+    except s3_client.exceptions.NoSuchKey:
+        st.error(f"Predicted anomalies CSV file '{s3_key}' not found in S3 bucket '{s3_bucket}'.")
+        return pd.DataFrame()
+    except botocore.exceptions.ClientError as e:
+        st.error(f"Error accessing S3: {e}")
         return pd.DataFrame()
 
     if 'predicted_date' not in df.columns:
         st.error("Required column 'predicted_date' missing in predicted anomalies CSV.")
+        return pd.DataFrame()
+
+    if f'predicted_{selected_param}' not in df.columns:
+        st.error(f"Required column 'predicted_{selected_param}' not found in predicted data. Cannot proceed with anomaly detection.")
         return pd.DataFrame()
 
     df['predicted_date'] = pd.to_datetime(df['predicted_date'], errors='coerce').dt.tz_localize(None)
@@ -153,11 +182,20 @@ def load_predicted_anomalies(file_path, selected_param, iqr_stats):
                       lower_threshold - x if x < lower_threshold else 0
         )
     else:
-        st.warning(f"Column 'predicted_{selected_param}' not found in predicted data. Setting anomaly_deviation to 0.")
         df['anomaly_deviation'] = 0
 
     df['anomaly_feature'] = selected_param
     return df
+
+def save_to_s3(obj, s3_bucket, s3_key):
+    try:
+        buffer = io.BytesIO()
+        joblib.dump(obj, buffer)
+        buffer.seek(0)
+        s3_client.upload_fileobj(buffer, s3_bucket, s3_key)
+    except botocore.exceptions.ClientError as e:
+        st.error(f"Failed to upload model to S3: {e}")
+        raise
 
 def wrap_text(text, width=30):
     return '<br>'.join(textwrap.wrap(text, width=width))
@@ -167,14 +205,16 @@ def main():
     st.title("Chromatography Anomaly Detection Dashboard")
 
     try:
-        df, label_encoders = load_and_preprocess_data(CSV_FILE)
+        df, label_encoders = load_and_preprocess_data(S3_BUCKET, S3_CSV_FILE)
     except Exception as e:
         st.error(f"Error loading data: {e}")
         return
 
     st.sidebar.header("Apply Filters")
-    start_date = datetime(2024, 10, 5)
-    end_date = datetime(2024, 10, 18)
+    min_date = df['injection_time'].min().date() if 'injection_time' in df.columns else datetime(2024, 10, 5).date()
+    max_date = df['injection_time'].max().date() if 'injection_time' in df.columns else datetime(2024, 10, 18).date()
+    start_date = st.sidebar.date_input("Training Start Date", min_date, min_value=min_date, max_value=max_date)
+    end_date = st.sidebar.date_input("Training End Date", max_date, min_value=min_date, max_value=max_date)
     system_name = st.sidebar.selectbox("System Name", ["All"] + sorted(df['system_name_original'].unique().tolist()))
     method_set = st.sidebar.selectbox("Method Set", ["All"] + sorted(df['method_set_name_original'].unique().tolist()))
     selected_column = st.sidebar.multiselect("Column Serial Number", ["All"] + sorted(df['column_serial_number_original'].unique().tolist()), default=["All"])
@@ -221,12 +261,12 @@ def main():
 
     iso_model = train_anomaly_model(X)
     filtered_data, iqr_stats = detect_anomalies(filtered_data, X, iso_model, feature_cols, selected_param)
-    joblib.dump({'model': iso_model, 'scaler': scaler, 'label_encoders': label_encoders}, MODEL_OUTPUT)
+    save_to_s3({'model': iso_model, 'scaler': scaler, 'label_encoders': label_encoders}, S3_BUCKET, S3_MODEL_OUTPUT)
 
     historical_values = filtered_data[selected_param].values
     anomaly_threshold = np.mean(historical_values) + 3 * np.std(historical_values)
 
-    future_anomalies = load_predicted_anomalies(PREDICTED_CSV_FILE, selected_param, iqr_stats)
+    future_anomalies = load_predicted_anomalies(S3_BUCKET, S3_PREDICTED_CSV_FILE, selected_param, iqr_stats)
 
     fig = go.Figure()
 
@@ -243,7 +283,7 @@ def main():
             mode='markers',
             name=f'{color_by}: {val}',
             marker=dict(color=color_map[val]),
-            showlegend=False,  # Hide legend marker
+            showlegend=False,
             hovertemplate=f'<b>Date</b>: %{{x}}<br><b>{selected_param}</b>: %{{y:.3f}}<br><b>{color_by}</b>: %{{customdata}}<extra></extra>',
             customdata=subset[color_col]
         ))
@@ -258,7 +298,7 @@ def main():
         text=historical_anomalies.apply(
             lambda row: (
                 f"Date: {row['injection_time']}<br>"
-                f"Parameter: {selected_param}: {row[selected_param]:.3f}<br>"
+                f"Parameter: {row[selected_param]:.3f}<br>"
                 f"Anomaly: Yes<br>"
                 f"{color_by}: {str(row[color_col]) if pd.notnull(row[color_col]) else 'Unknown'}<br>"
                 f"Feature: {str(row['anomaly_feature']) if pd.notnull(row['anomaly_feature']) else selected_param}<br>"
@@ -282,7 +322,7 @@ def main():
                 name=f'Predicted {color_by}: {val}',
                 visible='legendonly',
                 marker=dict(color=color_map[val] if val in color_map else '#888888'),
-                showlegend=False,  # Hide legend marker
+                showlegend=False,
                 hovertemplate=f'<b>Date</b>: %{{x}}<br><b>{selected_param}</b>: %{{y:.3f}}<br><b>{color_by}</b>: %{{customdata}}<extra></extra>',
                 customdata=subset[pred_color_col]
             ))
@@ -343,7 +383,6 @@ def main():
         color = color_map[item]
         html_items += f'<span style="color:{color};font-size:16px;margin-right:5px;">●</span><span style="margin-right:15px;">{item}</span>'
 
-    # Render the HTML string
     st.markdown(f'<div>{html_items}</div>', unsafe_allow_html=True)
 
     st.subheader("Historical Data Table")
@@ -425,42 +464,52 @@ def main():
 
     if not future_anomalies.empty:
         load_dotenv()
-        client = OpenAI(api_key=os.getenv("OPENAI_API_KEY"))
-
-        anomaly_summary = future_anomalies[future_anomalies['anomaly_flag']]
-        if not anomaly_summary.empty:
-            summary_text = f"Summary of future anomalies for {selected_param} starting from {prediction_start.strftime('%Y-%m-%d')}:\n"
-            for index, row in anomaly_summary.iterrows():
-                summary_text += (
-                    f"- Date: {row['predicted_date']}, "
-                    f"Predicted Value: {row[f'predicted_{selected_param}']:.3f}, "
-                    f"Cause: {row['anomaly_cause']}, "
-                    f"Replacement Alert: {row['replacement_alert']}\n"
-                )
-            summary_text += "Please review these predictions and take action if necessary."
-
-            response = client.chat.completions.create(
-                model="gpt-4.1-nano",
-                messages=[
-                    {
-                        "role": "system",
-                        "content": (
-                            "You are a chromatography expert summarizing anomaly predictions. "
-                            "Provide a concise summary in tabular format, including Date, Parameter, Cause, and Replacement Alert. "
-                            "Ensure causes are specific to chromatography (e.g., column clogging for high peak width, contamination for high retention time) "
-                            "and include actionable recommendations."
-                            "if u dont find any data like values dont show it like NAN or anything just remove the bar and if find than only put it"
-                        )
-                    },
-                    {"role": "user", "content": f"Summarize the following anomaly data: {summary_text}"}
-                ],
-                max_tokens=500
-            )
-
-            st.subheader("Future Anomaly Summary")
-            st.write(response.choices[0].message.content)
+        api_key = os.getenv("OPENAI_API_KEY")
+        if not api_key:
+            st.warning("OpenAI API key not found. Skipping anomaly summary generation.")
         else:
-            st.warning("No future anomalies detected. Check model sensitivity or data range.")
+            try:
+                client = OpenAI(api_key=api_key)
+                anomaly_summary = future_anomalies[future_anomalies['anomaly_flag']]
+                if not anomaly_summary.empty:
+                    summary_text = f"Summary of future anomalies for {selected_param} starting from {prediction_start.strftime('%Y-%m-%d')}:\n"
+                    for index, row in anomaly_summary.iterrows():
+                        summary_text += (
+                            f"- Date: {row['predicted_date']}, "
+                            f"Predicted Value: {row[f'predicted_{selected_param}']:.3f}, "
+                            f"Cause: {row['anomaly_cause']}, "
+                            f"Replacement Alert: {row['replacement_alert']}\n"
+                        )
+                    summary_text += "Please review these predictions and take action if necessary."
+
+                    response = client.chat.completions.create(
+                        model="gpt-4o",  # Use a valid model
+                        messages=[
+                            {
+                                "role": "system",
+                                "content": (
+                                    "You are a chromatography expert summarizing anomaly predictions. "
+                                    "Provide a concise summary in tabular format, including Date, Parameter, Cause, and Replacement Alert. "
+                                    "Ensure causes are specific to chromatography (e.g., column clogging for high peak width, contamination for high retention time) "
+                                    "and include actionable recommendations. "
+                                    "If no data is available for a field, exclude it rather than showing NaN or empty values."
+                                )
+                            },
+                            {"role": "user", "content": f"Summarize the following anomaly data: {summary_text}"}
+                        ],
+                        max_tokens=500
+                    )
+
+                    st.subheader("Future Anomaly Summary")
+                    st.write(response.choices[0].message.content)
+                else:
+                    st.warning("No future anomalies detected. Check model sensitivity or data range.")
+            except openai.error.AuthenticationError:
+                st.warning("Invalid OpenAI API key. Skipping anomaly summary generation.")
+            except openai.error.InvalidRequestError:
+                st.warning("Invalid OpenAI model specified. Skipping anomaly summary generation.")
+            except Exception as e:
+                st.warning(f"Error generating anomaly summary: {e}")
 
 if __name__ == "__main__":
     main()
